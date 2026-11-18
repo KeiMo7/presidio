@@ -26,6 +26,7 @@ def make_args(**overrides):
         "files": ("tests/",),
         "format": "auto",
         "no_warnings": False,
+        "sarif_output": None,
         "threshold": None,
     }
     args.update(overrides)

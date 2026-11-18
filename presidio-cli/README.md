@@ -187,9 +187,66 @@ presidio -d "entities:
 {"entity_type": "PERSON", "start": 32, "end": 37, "score": 0.85, "analysis_explanation": null}
 ```
 
+- sarif - SARIF 2.1.0 log written to standard output. Use `--sarif-output` to
+  atomically write the log to a file instead.
+
 - auto - default format, switches automatically between those 2 modes:
   - github, if run on github - environment variables `GITHUB_ACTIONS` and `GITHUB_WORKFLOW` are set
   - colored, otherwise
+
+### SARIF output
+
+`presidio-cli` can emit SARIF 2.1.0 for security dashboards without changing
+the default or any existing output format:
+
+```shell
+# Write a SARIF file atomically. Human-readable findings are suppressed.
+presidio --sarif-output presidio.sarif .
+
+# Write the same document to standard output.
+presidio -f sarif . > presidio.sarif
+```
+
+Each finding is a separate SARIF `result`, even when the same entity or rule
+matches several times in one file or across files. `ruleId` is
+`PII.<ENTITY_TYPE>` (for example, `PII.CREDIT_CARD`) and is independent of
+paths, timestamps, and process-specific values. Locations use the exact
+1-based start line/column and exclusive end column. Artifact paths are relative
+to the nearest Git root (or the scanned directory when there is no Git root)
+and non-ASCII or reserved path characters are percent-encoded.
+
+Severity is mapped by the code-level `SARIF_LEVEL_BY_SEVERITY` table:
+
+- high confidence (`score >= 1.0`) -> `error`
+- medium confidence (`score >= 0.5`) -> `warning`
+- hint (`score < 0.5`) -> `note`
+
+Exit codes are unchanged. `--no-warnings` continues to filter out findings that
+the existing human-readable output classifies as warnings.
+
+If an input scan fails, the published SARIF remains schema-valid and records
+`invocations[0].executionSuccessful: false` plus a sanitized execution
+notification. Exception text is not written to the SARIF file or logs, so
+credentials, user data, and absolute paths are not exposed. If the log cannot
+be completed or self-validated, the temporary file is discarded and any
+previous output file is left untouched. A failed publish is reported on
+standard error and uses exit code `1`.
+
+Migration from the parsable output:
+
+```shell
+# Before: one JSON object per finding on standard output
+presidio -f parsable . > findings.json
+
+# After: one complete SARIF 2.1.0 document accepted by security dashboards
+presidio --sarif-output findings.sarif .
+```
+
+This is an output option only; there is no new configuration-file key and no
+default behavior changes. The SARIF writer is process-local and serial. Parallel
+scans should write different output files; concurrent writers targeting the
+same path are last-writer-wins because each document is published with an
+atomic replace.
 
 ### Warnings and errors
 

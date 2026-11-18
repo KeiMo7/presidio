@@ -2,15 +2,25 @@ import argparse
 import io
 import json
 import locale
+import logging
 import os
 import platform
+import shutil
 import sys
+import tempfile
 import traceback
 from typing import Generator, List
 
 from presidio_cli import APP_DESCRIPTION, APP_VERSION, SHELL_NAME
 from presidio_cli.analyzer import PIIProblem, analyze
 from presidio_cli.config import PresidioCLIConfig, PresidioCLIConfigError
+from presidio_cli.sarif import SarifValidationError, SarifWriter
+
+logger = logging.getLogger("presidio-cli")
+
+
+class SarifOutputError(Exception):
+    """Represents a failure to write a complete SARIF log."""
 
 
 class Format(object):
@@ -104,9 +114,7 @@ def threshold_value(value: str) -> float:
         raise argparse.ArgumentTypeError("threshold must be a float") from e
 
     if not 0.0 <= threshold <= 1.0:
-        raise argparse.ArgumentTypeError(
-            "threshold must be between 0.0 and 1.0"
-        )
+        raise argparse.ArgumentTypeError("threshold must be between 0.0 and 1.0")
 
     return threshold
 
@@ -199,6 +207,167 @@ def find_files_recursively(
                 yield item
 
 
+def _find_git_root(start: str) -> str:
+    """Return the nearest Git root, or an empty string when none exists."""
+    current = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return ""
+        current = parent
+
+
+def _find_repository_root(start: str = None) -> str:
+    """Find the nearest Git root, falling back to the current directory."""
+    return _find_git_root(start or os.getcwd()) or os.path.abspath(os.getcwd())
+
+
+def _repository_root_for_inputs(items: List[str]) -> str:
+    """Choose one root that keeps every input artifact path relative."""
+    existing = [
+        os.path.abspath(os.fspath(item)) for item in items if os.path.exists(item)
+    ]
+    if not existing:
+        return _find_repository_root()
+
+    cwd = os.path.abspath(os.getcwd())
+    bases = [
+        item if os.path.isdir(item) else os.path.dirname(item) for item in existing
+    ]
+    git_roots = {_find_git_root(base) for base in bases} - {""}
+    if len(git_roots) == 1:
+        return git_roots.pop()
+
+    try:
+        if all(os.path.commonpath([cwd, base]) == cwd for base in bases):
+            return cwd
+        return os.path.commonpath(bases)
+    except ValueError:
+        return cwd
+
+
+def _scan_sarif(
+    conf: PresidioCLIConfig,
+    args: argparse.Namespace,
+    writer: SarifWriter,
+    excluded_paths=frozenset(),
+) -> int:
+    """Scan inputs and stream findings into a SARIF writer."""
+    prob_num = 0
+    try:
+        for file in find_files_recursively(args.files, conf):
+            if os.path.abspath(file) in excluded_paths:
+                continue
+            filepath = (
+                file[2:] if file.startswith("./") or file.startswith(".\\") else file
+            )
+            try:
+                with io.open(file, newline="", encoding="utf-8") as f:
+                    problems = analyze(f, conf, filepath)
+                    for problem in problems:
+                        if args.no_warnings and problem.level != "error":
+                            continue
+                        writer.write_result(problem, os.path.abspath(file))
+                        prob_num += 1
+            except SarifValidationError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "SARIF scan failed for an input: error_type=%s",
+                    type(exc).__name__,
+                )
+                writer.record_failure(exc)
+    except SarifValidationError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "SARIF scan failed while enumerating inputs: error_type=%s",
+            type(exc).__name__,
+        )
+        writer.record_failure(exc)
+
+    if args.stdin:
+        try:
+            problems = analyze(sys.stdin, conf, "")
+            for problem in problems:
+                if args.no_warnings and problem.level != "error":
+                    continue
+                writer.write_result(problem, "stdin")
+                prob_num += 1
+        except SarifValidationError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "SARIF scan failed for standard input: error_type=%s",
+                type(exc).__name__,
+            )
+            writer.record_failure(exc)
+
+    exit_code = 1 if prob_num > 0 else 0
+    writer.finish(exit_code)
+    logger.info(
+        "SARIF scan completed: results=%d failures=%d",
+        writer.result_count,
+        writer.failure_count,
+    )
+    return prob_num
+
+
+def _write_sarif_file(
+    output_path: str, conf: PresidioCLIConfig, args: argparse.Namespace
+) -> int:
+    """Stream SARIF to a temporary file and atomically publish it."""
+    target = os.path.abspath(os.fspath(output_path))
+    directory = os.path.dirname(target) or os.curdir
+    try:
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=directory,
+            prefix=".presidio-sarif-",
+            delete=False,
+        )
+    except OSError:
+        raise SarifOutputError("Unable to create SARIF output file.") from None
+
+    temp_name = temp_file.name
+    published = False
+    try:
+        with temp_file:
+            writer = SarifWriter(temp_file, _repository_root_for_inputs(args.files))
+            prob_num = _scan_sarif(
+                conf,
+                args,
+                writer,
+                excluded_paths=frozenset({temp_name, target}),
+            )
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, target)
+        published = True
+        return prob_num
+    finally:
+        if not published:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
+def _write_sarif_stdout(conf: PresidioCLIConfig, args: argparse.Namespace) -> int:
+    """Stream SARIF to a temporary file, then emit it only when complete."""
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="\n") as temp_file:
+        writer = SarifWriter(temp_file, _repository_root_for_inputs(args.files))
+        prob_num = _scan_sarif(conf, args, writer)
+        temp_file.flush()
+        temp_file.seek(0)
+        shutil.copyfileobj(temp_file, sys.stdout)
+        return prob_num
+
+
 def run() -> None:
     """Entrypoint of Presidio CLI."""
     parser = argparse.ArgumentParser(prog=SHELL_NAME, description=APP_DESCRIPTION)
@@ -237,9 +406,16 @@ def run() -> None:
     parser.add_argument(
         "-f",
         "--format",
-        choices=("standard", "github", "auto", "colored", "parsable"),
+        choices=("standard", "github", "auto", "colored", "parsable", "sarif"),
         default="auto",
         help="format for parsing output",
+    )
+
+    parser.add_argument(
+        "--sarif-output",
+        metavar="PATH",
+        default=None,
+        help="write a SARIF 2.1.0 log to PATH instead of human-readable output",
     )
 
     parser.add_argument(
@@ -276,6 +452,35 @@ def run() -> None:
 
     if conf.locale is not None:
         locale.setlocale(locale.LC_ALL, conf.locale)
+
+    sarif_output = getattr(args, "sarif_output", None)
+    if not isinstance(sarif_output, (str, os.PathLike)):
+        sarif_output = None
+
+    if sarif_output is not None or args.format == "sarif":
+        logger.info("Starting SARIF scan")
+        try:
+            if sarif_output is not None:
+                prob_num = _write_sarif_file(sarif_output, conf, args)
+            else:
+                prob_num = _write_sarif_stdout(conf, args)
+        except SarifValidationError as exc:
+            logger.error("SARIF output validation failed")
+            print(exc, file=sys.stderr)
+            sys.exit(1)
+            return
+        except (SarifOutputError, OSError) as exc:
+            logger.error("SARIF output failed: error_type=%s", type(exc).__name__)
+            message = (
+                str(exc)
+                if isinstance(exc, SarifOutputError)
+                else "Unable to write SARIF output."
+            )
+            print(message, file=sys.stderr)
+            sys.exit(1)
+            return
+        sys.exit(1 if prob_num > 0 else 0)
+        return
 
     prob_num = 0
     for file in find_files_recursively(args.files, conf):
